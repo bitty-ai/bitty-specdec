@@ -20,6 +20,29 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, theta: float = 1_000_000.0):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """position_ids: [B, L] -> cos, sin: [B, 1, L, head_dim] (fp32)"""
+        freqs = position_ids[..., None].float() * self.inv_freq
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos()[:, None], emb.sin()[:, None]
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return (x.float() * cos + rotate_half(x.float()) * sin).to(x.dtype)
+
+
 class DFlashAttention(nn.Module):
     """Multi-head attention with target KV injection.
 
@@ -47,18 +70,24 @@ class DFlashAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
         self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=bias)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [B, L_draft, D] draft token hidden states
             target_hidden_states: [B, L_ctx, D] target model context features
-            attention_mask: [B, 1, L_draft, L_ctx + L_draft] or None
+            attention_mask: [B, 1, L_draft, L_ctx + L_draft] bool (True = attend)
+                or additive float mask, or None
+            position_embeddings: (cos, sin) of shape [B, 1, L_ctx + L_draft, head_dim]
+                for the concatenated [context; draft] keys. Queries use the last L_draft.
 
         Returns:
             output: [B, L_draft, D] attended hidden states
@@ -66,45 +95,30 @@ class DFlashAttention(nn.Module):
         B, L_draft, _ = hidden_states.shape
         L_ctx = target_hidden_states.shape[1]
 
-        # Project Q from draft hidden states
-        q = self.q_proj(hidden_states)
-        q = q.view(B, L_draft, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(hidden_states).view(B, L_draft, self.num_heads, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)
 
-        # Project K, V from BOTH target context and draft
-        k_ctx = self.k_proj(target_hidden_states)
-        k_draft = self.k_proj(hidden_states)
-        k = torch.cat([k_ctx, k_draft], dim=1)
-        k = k.view(B, L_ctx + L_draft, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        kv_input = torch.cat([target_hidden_states.to(hidden_states.dtype), hidden_states], dim=1)
+        k = self.k_proj(kv_input).view(B, L_ctx + L_draft, self.num_kv_heads, self.head_dim)
+        k = self.k_norm(k).transpose(1, 2)
+        v = self.v_proj(kv_input).view(B, L_ctx + L_draft, self.num_kv_heads, self.head_dim)
+        v = v.transpose(1, 2)
 
-        v_ctx = self.v_proj(target_hidden_states)
-        v_draft = self.v_proj(hidden_states)
-        v = torch.cat([v_ctx, v_draft], dim=1)
-        v = v.view(B, L_ctx + L_draft, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            q = apply_rotary(q, cos[:, :, L_ctx:], sin[:, :, L_ctx:])
+            k = apply_rotary(k, cos, sin)
 
-        # Repeat KV heads for GQA
-        if self.num_kv_groups > 1:
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            attention_mask = attention_mask.to(q.dtype)
 
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        attn_output = torch.matmul(attn_weights, v)
-
-        # Handle empty draft (reshape with 0 elements)
-        if L_draft == 0:
-            return self.o_proj(attn_output.transpose(1, 2).reshape(B, 0, self.num_heads * self.head_dim))
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(B, L_draft, -1)
-
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            enable_gqa=self.num_kv_groups > 1,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(B, L_draft, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
 
@@ -159,6 +173,7 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Pre-norm attention with context injection
         residual = hidden_states
@@ -167,6 +182,7 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states,
             target_hidden_states,
             attention_mask,
+            position_embeddings,
         )
         hidden_states = residual + hidden_states
 
@@ -200,6 +216,7 @@ class DFlashBackbone(nn.Module):
         dropout: float = 0.0,
         activation: str = "gelu",
         bias: bool = False,
+        rope_theta: float = 1_000_000.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -219,7 +236,8 @@ class DFlashBackbone(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm = nn.RMSNorm(hidden_size, eps=1e-6)
+        self.rotary_emb = RotaryEmbedding(hidden_size // num_attention_heads, theta=rope_theta)
 
     def forward(
         self,
@@ -227,6 +245,8 @@ class DFlashBackbone(nn.Module):
         target_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        context_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -234,17 +254,27 @@ class DFlashBackbone(nn.Module):
             target_hidden_states: [B, L_ctx, D] target model context features
             attention_mask: optional mask for causal/non-causal attention
             output_hidden_states: if True, return all hidden layer outputs
+            position_ids: [B, L_draft] absolute positions of draft tokens (enables RoPE)
+            context_position_ids: [B, L_ctx] absolute positions of context tokens
 
         Returns:
             hidden_states: [B, L_draft, D] after all backbone layers
         """
         all_hidden = [hidden_states] if output_hidden_states else None
 
+        position_embeddings = None
+        if position_ids is not None:
+            if context_position_ids is None:
+                B, L_ctx = target_hidden_states.shape[:2]
+                context_position_ids = torch.arange(L_ctx, device=position_ids.device).expand(B, -1)
+            position_embeddings = self.rotary_emb(torch.cat([context_position_ids, position_ids], dim=1))
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
                 target_hidden_states,
                 attention_mask,
+                position_embeddings,
             )
             if output_hidden_states:
                 all_hidden.append(hidden_states)
@@ -273,6 +303,9 @@ class DSparkAttentionMask:
         device: torch.device,
     ) -> torch.Tensor:
         """Create a block-diagonal attention mask for DSpark.
+
+        Warning: lets every block see all context, which leaks future tokens when the
+        context is the full training sequence. Training uses create_block_context_mask.
 
         Each block's draft tokens can attend to:
         - All context tokens (bidirectional)
@@ -306,3 +339,33 @@ class DSparkAttentionMask:
                 mask[b, :, start:end, L_ctx + end:L_ctx + L_draft] = float("-inf")
 
         return mask
+
+
+    @staticmethod
+    def create_block_context_mask(
+        *,
+        anchor_positions: torch.Tensor,
+        block_size: int,
+        context_len: int,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Leak-free mask matching inference: the block anchored at p sees target
+        context j < p (the anchor itself is not yet consumed by the target) and its
+        own block bidirectionally, never other blocks.
+
+        Args:
+            anchor_positions: [B, N]
+            context_mask: [B, L_ctx] 1 for real tokens
+
+        Returns:
+            mask: [B, 1, N * block_size, L_ctx + N * block_size] bool (True = attend)
+        """
+        B, N = anchor_positions.shape
+        device = anchor_positions.device
+        q_block = torch.arange(N, device=device).repeat_interleave(block_size)
+        q_anchor = anchor_positions[:, q_block]
+        ctx_ok = torch.arange(context_len, device=device)[None, None, :] < q_anchor[:, :, None]
+        if context_mask is not None:
+            ctx_ok = ctx_ok & context_mask[:, None, :].bool()
+        blk_ok = (q_block[:, None] == q_block[None, :]).expand(B, -1, -1)
+        return torch.cat([ctx_ok, blk_ok], dim=-1)[:, None]

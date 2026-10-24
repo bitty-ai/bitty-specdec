@@ -86,7 +86,7 @@ def main():
 
     # 3. Load tiny dataset
     print("\n[2/5] Loading dataset...")
-    dataset = load_dataset("trl-lib/Capybara", split="train", trust_remote_code=True)
+    dataset = load_dataset("trl-lib/Capybara", split="train")
     texts = [tokenizer.apply_chat_template(
         sample["messages"], tokenize=False, add_generation_prompt=False
     ) for sample in dataset.select(range(args.samples))]
@@ -105,18 +105,22 @@ def main():
     vocab_size = target.config.vocab_size
     hidden_size = target.config.hidden_size
 
+    target_layer_ids = [1, target.config.num_hidden_layers // 2, target.config.num_hidden_layers - 3]
     draft = DSparkDraftModel(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         num_layers=2,  # tiny backbone for smoke test
-        num_attention_heads=4,
+        num_attention_heads=target.config.num_attention_heads,
+        num_kv_heads=target.config.num_key_value_heads,
         intermediate_size=hidden_size * 2,
+        num_target_layers=len(target_layer_ids),
+        block_size=args.block_size,
         markov_rank=64,  # smaller rank for smoke test
         markov_head_type="vanilla",
         use_confidence_head=True,
-        max_seq_len=2048,
     )
-    num_params = sum(p.numel() for p in draft.parameters())
+    draft.share_target_embeddings(target)
+    num_params = sum(p.numel() for p in draft.parameters() if p.requires_grad)
     print(f"  Draft model: {num_params/1e6:.2f}M params ({num_params:,})")
 
     # 5. Train
@@ -124,9 +128,10 @@ def main():
     trainer = DSparkTrainer(
         draft_model=draft,
         target_model=target,
-        tokenizer=tokenizer,
+        target_layer_ids=target_layer_ids,
         learning_rate=args.lr,
-        block_size=args.block_size,
+        warmup_steps=0,
+        total_steps=args.steps,
         num_anchors=args.num_anchors,
         ce_alpha=0.1,
         tv_alpha=0.9,

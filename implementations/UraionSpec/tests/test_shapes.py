@@ -15,48 +15,73 @@ from uraionspec.training import compute_dspark_loss, build_position_weights
 class TestModelShapes:
     """Test tensor shapes through all model components."""
 
+    V, D, G, F_LAYERS = 100, 64, 4, 2
+
     @pytest.fixture
     def model(self):
+        torch.manual_seed(0)
         return DSparkDraftModel(
-            vocab_size=100,
-            hidden_size=64,
+            vocab_size=self.V,
+            hidden_size=self.D,
             num_layers=2,
             num_attention_heads=4,
             intermediate_size=128,
+            num_target_layers=self.F_LAYERS,
+            block_size=self.G,
             markov_rank=16,
             markov_head_type="vanilla",
             use_confidence_head=True,
-        )
+        ).eval()
+
+    def _inputs(self, batch=2, n=3, ctx_len=12):
+        anchors = torch.randint(1, ctx_len - self.G, (batch, n))
+        target_hidden = torch.randn(batch, ctx_len, self.F_LAYERS * self.D)
+        prev_ids = torch.randint(0, self.V, (batch, n, self.G))
+        return anchors, target_hidden, prev_ids
 
     def test_forward_shapes(self, model):
-        batch, block_size = 2, 4
-        input_ids = torch.randint(0, 100, (batch, block_size))
-        prev_ids = torch.randint(0, 100, (batch, block_size))
+        anchors, target_hidden, prev_ids = self._inputs()
+        output = model(prev_ids[:, :, 0], anchors, target_hidden, prev_token_ids=prev_ids)
 
-        output = model(input_ids, prev_token_ids=prev_ids, return_confidence=True)
-
-        assert output["base_logits"].shape == (batch, block_size, 100)
-        assert output["hidden_states"].shape == (batch, block_size, 64)
-        assert output["draft_logits"].shape == (batch, block_size, 100)
-        assert output["confidence_logits"].shape == (batch, block_size)
+        assert output["base_logits"].shape == (2, 3, self.G, self.V)
+        assert output["hidden_states"].shape == (2, 3, self.G, self.D)
+        assert output["draft_logits"].shape == (2, 3, self.G, self.V)
+        assert output["confidence_logits"].shape == (2, 3, self.G)
 
     def test_forward_no_confidence(self, model):
-        model.use_confidence_head = False
-        batch, block_size = 2, 4
-        input_ids = torch.randint(0, 100, (batch, block_size))
-
-        output = model(input_ids, return_confidence=False)
+        anchors, target_hidden, prev_ids = self._inputs()
+        output = model(prev_ids[:, :, 0], anchors, target_hidden, prev_token_ids=prev_ids,
+                       return_confidence=False)
         assert "confidence_logits" not in output
 
+    def test_no_future_context_leak(self, model):
+        """A block anchored at p must not see target features at positions >= p or other blocks."""
+        anchors = torch.tensor([[3, 7]])
+        _, target_hidden, prev_ids = self._inputs(batch=1, n=2)
+        out = model(prev_ids[:, :, 0], anchors, target_hidden, prev_token_ids=prev_ids)
+
+        perturbed = target_hidden.clone()
+        perturbed[:, 3:] += torch.randn_like(perturbed[:, 3:])
+        out2 = model(prev_ids[:, :, 0], anchors, perturbed, prev_token_ids=prev_ids)
+        assert torch.allclose(out["draft_logits"][:, 0], out2["draft_logits"][:, 0], atol=1e-5)
+        assert not torch.allclose(out["draft_logits"][:, 1], out2["draft_logits"][:, 1], atol=1e-5)
+
+    def test_mask_slots_differ(self, model):
+        """Positional encoding must make identical mask slots produce different outputs."""
+        anchors, target_hidden, prev_ids = self._inputs(batch=1, n=1)
+        hidden = model(prev_ids[:, :, 0], anchors, target_hidden)["hidden_states"][0, 0]
+        assert not torch.allclose(hidden[1], hidden[2], atol=1e-5)
+
     def test_sample_block_shapes(self, model):
-        batch, gamma = 2, 4
+        _, target_hidden, _ = self._inputs()
         anchor_ids = torch.tensor([10, 20])
+        anchor_positions = torch.tensor([5, 8])
 
-        output = model.sample_block(anchor_ids, gamma=gamma, temperature=0.0)
+        output = model.sample_block(anchor_ids, anchor_positions, target_hidden, temperature=0.0)
 
-        assert output["draft_tokens"].shape == (batch, gamma)
-        assert output["draft_logits"].shape == (batch, gamma, 100)
-        assert output["confidence"].shape == (batch, gamma)
+        assert output["draft_tokens"].shape == (2, self.G)
+        assert output["draft_logits"].shape == (2, self.G, self.V)
+        assert output["confidence"].shape == (2, self.G)
 
 
 class TestLossShapes:
@@ -145,19 +170,22 @@ class TestIntegration:
 
     def test_draft_verify_cycle(self):
         """Test draft -> verify -> accept cycle end-to-end."""
-        V = 50
+        V, D, gamma = 50, 32, 4
         model = DSparkDraftModel(
-            vocab_size=V, hidden_size=32, num_layers=1,
+            vocab_size=V, hidden_size=D, num_layers=1,
             num_attention_heads=2, intermediate_size=64,
+            num_target_layers=1, block_size=gamma,
             markov_rank=8, markov_head_type="vanilla",
             use_confidence_head=True,
         )
 
-        batch, gamma = 2, 4
+        batch = 2
         anchor_ids = torch.tensor([10, 20])
 
         # Draft
-        draft_out = model.sample_block(anchor_ids, gamma=gamma, temperature=0.0)
+        draft_out = model.sample_block(
+            anchor_ids, torch.tensor([3, 5]), torch.randn(batch, 6, D), temperature=0.0
+        )
         assert draft_out["draft_tokens"].shape == (batch, gamma)
         assert draft_out["draft_logits"].shape == (batch, gamma, V)
         assert draft_out["confidence"].shape == (batch, gamma)
@@ -193,9 +221,7 @@ class TestIntegration:
 
         # Confidence targets
         confidence_pred = torch.randn(B, N, bs, requires_grad=True)
-        confidence_targets = torch.sigmoid(
-            compute_accept_rate(draft_logits, target_logits).detach()
-        )
+        confidence_targets = compute_accept_rate(draft_logits, target_logits).detach()
 
         loss_dict = compute_dspark_loss(
             draft_logits=draft_logits,
