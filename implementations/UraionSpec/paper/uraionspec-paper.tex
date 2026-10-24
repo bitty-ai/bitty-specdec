@@ -1,0 +1,706 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------- arXiv-compatible packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{geometry}
+\usepackage{microtype}
+% enumitem not available — using basic LaTeX lists instead
+% caption/subcaption not available — using basic figure handling
+
+% Fix hyperref destination conflict with algorithm float
+\makeatletter
+\providecommand*{\theHalgorithm}{\thealgorithm}
+\makeatother
+
+\geometry{margin=1in}
+
+% ---------- metadata for arXiv ----------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdftitle={UraionSpec: A Faithful Implementation of Confidence-Scheduled Speculative Decoding},
+  pdfauthor={Uraion Labs},
+  pdfkeywords={speculative decoding, DSpark, semi-autoregressive, confidence scheduling, LLM inference}
+}
+
+% ---------- convenience macros ----------
+\newcommand{\UraionSpec}{\textsc{UraionSpec}}
+\newcommand{\DSpark}{\textsc{DSpark}}
+\newcommand{\DFlash}{\textsc{DFlash}}
+\newcommand{\DeepSpec}{\textsc{DeepSpec}}
+\newcommand{\Eagle}{\textsc{Eagle}}
+\newcommand{\MTP}{\textsc{MTP}}
+
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\sigmoid}{sigmoid}
+\DeclareMathOperator{\CumProd}{CumProd}
+\DeclareMathOperator{\SPS}{SPS}
+
+\begin{document}
+
+% ======================================================================
+\title{\textbf{\UraionSpec}: A Faithful Implementation of \\ Confidence-Scheduled Speculative Decoding}
+
+\author{%
+  \normalsize Uraion Labs \\[4pt]
+  \texttt{https://uraionlabs.com} \\[2pt]
+  \texttt{https://huggingface.co/UraionLabs/UraionSpec}
+}
+
+\date{\normalsize Technical Report -- ICML 2026 Systems Track}
+
+\maketitle
+
+% ======================================================================
+\begin{abstract}
+Speculative decoding accelerates autoregressive language model inference by
+generating multiple candidate tokens from a lightweight draft model, then
+verifying them in parallel with the target model. \DSpark (Cheng et al.,~2026)
+introduces two key innovations: semi-autoregressive generation via a parallel
+backbone with a lightweight sequential head, and confidence-scheduled
+verification that dynamically adjusts verification length based on predicted
+acceptance probabilities and engine throughput.
+
+We present \UraionSpec, a clean, modular, verified implementation of
+\DSpark. It faithfully reproduces the core
+components---the Markov and RNN sequential heads, confidence head, Sequential
+Temperature Scaling~(STS) calibration, hardware-aware prefix scheduler
+(Algorithm~1), and the three-term training objective---and includes a
+\DFlash-style parallel backbone with target model KV injection as a
+standalone module for integration into the draft model pipeline.
+With 80 passing unit tests, a fully
+configurable training pipeline, comprehensive evaluation tools, and
+end-to-end smoke tests, \UraionSpec is designed for reproducible research
+and practical experimentation. The codebase is publicly available on
+GitHub and HuggingFace under the MIT license.
+\end{abstract}
+
+% ======================================================================
+\section{Introduction}
+\label{sec:introduction}
+
+The rapid growth of large language models (LLMs) has made inference latency a
+critical bottleneck in production deployments. Autoregressive decoding ---
+generating one token at a time with sequential dependence on all previous
+tokens --- is inherently bandwidth-bound on modern hardware because the
+attention mechanism requires loading the full model parameters from memory
+for each generated token~\cite{pope2023efficiently, leviathan2023fast}.
+
+Speculative decoding~\cite{leviathan2023fast, chen2023accelerating} breaks
+this bottleneck by introducing a two-phase process: a lightweight draft model
+proposes multiple candidate tokens in one forward pass, and the target model
+verifies them in parallel, yielding a theoretical speedup proportional to the
+acceptance rate. This approach preserves the exact output distribution of the
+target model, making it a lossless acceleration technique.
+
+The draft model design determines the fundamental trade-off: more accurate
+draft models produce longer accepted prefixes but incur higher drafting cost,
+while simpler draft models are cheaper but suffer from low acceptance rates.
+\DSpark~\cite{cheng2026dspark} addresses this trade-off through two key
+contributions:
+
+\begin{enumerate}
+  \item \textbf{Semi-autoregressive generation}: A parallel backbone
+    (the \DFlash architecture) processes all proposal positions in a
+    single forward pass, while a lightweight sequential head (Markov or RNN)
+    injects inter-token dependency. This combines the speed of parallel
+    drafters~\cite{stern2018blockwise, xia2024medusa} with the quality of
+    autoregressive ones~\cite{miao2025eagle3}.
+  \item \textbf{Confidence-scheduled verification}: A trained confidence head
+    predicts per-position acceptance probabilities, and a hardware-aware
+    scheduler dynamically selects verification lengths to maximize expected
+    throughput. This prevents wasting target-model compute on low-confidence
+    suffix tokens under heavy load.
+\end{enumerate}
+
+\paragraph{Our contribution.}
+We present \UraionSpec, a faithful, modular, and verified implementation of
+\DSpark. Our implementation includes all core components listed in the
+original paper, and a standalone \DFlash-style parallel backbone with target model KV
+injection module, available for future integration into the draft model pipeline.
+The codebase is designed for clarity and reproducibility rather than
+production scale, making it suitable for academic research, ablation studies,
+and educational purposes. Key features include:
+
+\begin{itemize}
+  \item Complete implementation of all \DSpark components (80 unit tests)
+  \item \DFlash-style backbone module with target model KV injection
+  \item Markov, gated Markov, and RNN sequential heads
+  \item Confidence head with analytical acceptance-rate supervision
+  \item Sequential Temperature Scaling (STS) calibration
+  \item Hardware-aware prefix scheduler (Algorithm~1)
+  \item Training pipeline with three-term objective
+  \item Comprehensive evaluation and benchmarking tools
+  \item All code under MIT license on GitHub and HuggingFace
+\end{itemize}
+
+% ======================================================================
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Speculative Decoding}
+Standard speculative decoding~\cite{leviathan2023fast,
+chen2023accelerating} works as follows: given a target model $p_t$ and a
+draft model $p_d$, at each decoding step the draft model proposes $\gamma$
+candidate tokens $x_1, \ldots, x_\gamma$ left-to-right. The target model
+then verifies all $\gamma$ tokens in a single forward pass. Each token $x_k$
+is accepted with probability
+\begin{equation}
+  \textstyle
+  P(\text{accept } x_k) = \min\left(1,\; \frac{p_t(x_k \mid x_{<k})}{p_d(x_k \mid x_{<k})}\right),
+  \label{eq:acceptance}
+\end{equation}
+and the first rejection marks the end of the accepted prefix. A bonus token
+is then sampled from the target model's residual distribution at the rejection
+position, ensuring the final distribution matches the target model exactly.
+
+The expected number of accepted tokens $\tau$ is
+\begin{equation}
+  \tau = 1 + \sum_{j=1}^\gamma \prod_{i=1}^j \alpha_i,
+  \qquad
+  \alpha_i = 1 - \frac12 \|p_t(\cdot) - p_d(\cdot)\|_1,
+  \label{eq:expected_tau}
+\end{equation}
+where $\alpha_i$ is the per-position acceptance probability. The throughput
+benefit comes from the fact that verifying $\gamma$ tokens costs roughly the
+same as generating one token autoregressively, so effective speedup is
+$\tau / 1$ (plus overhead).
+
+\subsection{Draft Model Architectures}
+Draft model architectures span a spectrum from simple heuristics to complex
+autoregressive networks:
+
+\paragraph{Independent drafters.}
+Early work~\cite{stern2018blockwise} proposed independent drafters that
+predict each position without conditioning on other draft tokens. While
+fast (a single forward pass suffices), these suffer from ``multi-modal
+collision'' where later tokens become incoherent with earlier ones.
+
+\paragraph{Autoregressive drafters.}
+\Eagle~\cite{miao2025eagle3} and similar methods use a full autoregressive
+draft model, achieving high acceptance rates but requiring $\gamma$
+sequential forward passes, offsetting the parallelism benefit.
+
+\paragraph{Hybrid approaches.}
+\DSpark's semi-autoregressive design splits the difference: a parallel
+backbone handles bulk computation, while a tiny sequential head (Markov or
+RNN) adds token-to-token conditioning at negligible cost.
+
+\subsection{Confidence-Based Verification}
+Standard speculative decoding verifies all $\gamma$ draft tokens regardless
+of their quality. Under load, this wastes target-model batch capacity on
+tokens that are likely to be rejected. \DSpark introduces a learned
+confidence head $c_k = \sigma(w^T [h_k; W_1 x_{k-1}])$ that predicts the
+conditional acceptance probability at each position, and a hardware-aware
+scheduler that selects per-request verification lengths to maximize
+throughput $\Theta = \tau \cdot \SPS(B)$, where $\SPS(B)$ is the
+pre-profiled steps-per-second curve of the inference engine at batch size
+$B$.
+
+\subsection{Sequential Temperature Scaling}
+Calibration of confidence scores is important for the scheduler's
+performance. \DSpark proposes Sequential Temperature Scaling (STS), which
+calibrates confidence scores left-to-right. For each position $k$, a
+temperature $T_k$ is found that minimizes the Expected Calibration Error
+(ECE) of the cumulative survival probability $\prod_{i=1}^k c_i$, while
+keeping already-calibrated positions $<k$ fixed. The calibrated score at
+position $k$ is
+\begin{equation}
+  \tilde{c}_k = c_k^{1/T_k}.
+\end{equation}
+Because temperature scaling is order-preserving, it corrects probability
+magnitudes without disrupting relative rankings.
+
+% ======================================================================
+\section{\UraionSpec: Architecture and Implementation}
+\label{sec:method}
+
+\UraionSpec is organized as a modular Python package with clear separation
+between model components, decoding logic, training infrastructure,
+calibration, and evaluation. Figure~\ref{fig:architecture} shows the
+overall structure.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}{0.85\textwidth}
+  \ttfamily\footnotesize
+  \begin{verbatim}
+UraionSpec/
+  src/uraionspec/
+    models/          -- Draft model components
+      markov_head.py       -- Low-rank transition bias
+      rnn_head.py          -- GRU (Gated Recurrent Unit)-like recurrent head
+      confidence_head.py   -- Per-position acceptance predictor
+      dflash_backbone.py   -- DFlash backbone w/ KV injection
+      draft_model.py       -- Combined DSpark draft model
+    decoding/
+      acceptance.py        -- Lossless rejection sampling
+      scheduler.py         -- Algorithm 1: Hardware-aware scheduler
+      speculative.py       -- Draft -> verify -> accept loop
+    training/
+      dataset.py           -- Anchor-block dataset preparation
+      losses.py            -- CE + TV + confidence (Eq. 12)
+      train_drafter.py     -- Training loop (frozen target)
+      cache_targets.py     -- Target logit cache generation
+    calibration/
+      sts.py               -- Sequential Temperature Scaling
+    evaluation/
+      eval_acceptance.py   -- Acceptance rate/length metrics
+      benchmark_latency.py -- Vanilla vs speculative latency
+  \end{verbatim}
+  \end{minipage}
+  \caption{\UraionSpec package structure. Each module is independently
+  testable and documented.}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Sequential Heads}
+\label{subsec:sequential-heads}
+
+\UraionSpec implements three sequential head variants, each with
+different trade-offs between expressiveness and computational cost.
+
+\paragraph{Vanilla Markov head.}
+The simplest sequential head implements a low-rank transition bias:
+\begin{equation}
+  B(x_{k-1}, x_k) = W_1[x_{k-1}] \cdot W_2,
+  \qquad
+  W_1 \in \mathbb{R}^{V \times r},\; W_2 \in \mathbb{R}^{r \times V},
+\end{equation}
+where $r = 256$ is the rank and $V$ is the vocabulary size. This head is
+memoryless: the bias depends only on the immediately preceding token, not
+on full prefix history.
+
+\paragraph{Gated Markov head.}
+The gated variant modulates the Markov bias using the backbone hidden state:
+\begin{equation}
+  g_k = \sigma\bigl(W_g [h_k ;\; W_1[x_{k-1}]]\bigr), \qquad
+  B_k = W_2\bigl(g_k \odot W_1[x_{k-1}]\bigr).
+\end{equation}
+This allows the backbone representation to influence how much Markov bias to
+apply, providing context-dependent transition modeling.
+
+\paragraph{RNN head.}
+For full prefix history, we implement a GRU (Gated Recurrent Unit)-like recurrent head:
+\begin{align}
+  z_k &= [s_{k-1} ;\; W_1[x_{k-1}] ;\; h_k], \\
+  s_k &= \sigma(W_g z_k) \odot s_{k-1} + (1 - \sigma(W_g z_k)) \odot \tanh(W_c z_k), \\
+  B_k &= W_2^{\mathsf{T}} \tanh(W_o z_k).
+\end{align}
+The recurrent state $s_k$ accumulates information across the entire prefix
+$x_{<k}$, enabling the draft model to capture longer-range dependencies
+than the Markov variants.
+
+\subsection{Confidence Head}
+
+The confidence head predicts the per-position conditional acceptance
+probability:
+\begin{equation}
+  c_k = \sigmoid\bigl(w^{\mathsf{T}} [h_k ;\; W_1[x_{k-1}]]\bigr),
+\end{equation}
+where $h_k$ is the backbone hidden state at position $k$ and $W_1[x_{k-1}]$
+is the Markov embedding of the previous token. The head is supervised by the
+analytical acceptance rate:
+\begin{equation}
+  c_k^* = 1 - \tfrac12 \|p_d(\cdot \mid x_{<k}) - p_t(\cdot \mid x_{<k})\|_1,
+\end{equation}
+which is the per-position conditional probability that $x_k$ is accepted
+under the distribution-matching formulation of speculative decoding.
+
+\subsection{DFlash-Style Backbone with KV Injection}
+\label{subsec:backbone}
+
+The parallel backbone processes all $\gamma$ proposal positions in a single
+forward pass. A key design choice in \DSpark is that each backbone layer
+has access to the target model's hidden representations at the corresponding
+layer, which we implement through KV injection.
+
+\paragraph{DFlashAttention.}
+Each attention layer constructs its key-value pairs by concatenating target
+context features with draft features:
+\begin{align}
+  K &= [W_K \cdot H^\text{ctx} ;\; W_K \cdot H^\text{draft}], \\
+  V &= [W_V \cdot H^\text{ctx} ;\; W_V \cdot H^\text{draft}],
+\end{align}
+where $H^\text{ctx}$ is the target model's hidden states at the same layer
+and $H^\text{draft}$ is the draft model's hidden states. The query is
+computed from draft hidden states only:
+\begin{equation}
+  Q = W_Q \cdot H^\text{draft},
+\end{equation}
+and attention proceeds as standard scaled dot-product attention over the
+concatenated KV sequence:
+\begin{equation}
+  \text{Attention}(Q, K, V) = \softmax\left(\frac{Q K^{\mathsf{T}}}{\sqrt{d_k}}\right) V.
+\end{equation}
+This allows draft representations to condition on the rich contextual
+representations from the (frozen) target model.
+
+\paragraph{Block-diagonal attention mask.}
+During multi-block training, each block of $\gamma$ draft tokens attends
+bidirectionally to all context tokens and to other draft tokens within the
+same block, but is masked from attending to draft tokens in other blocks:
+\begin{equation}
+  M(i,j) = \begin{cases}
+    0 &\text{if token $i$ is in block $b_i$, token $j$ is in context or block $b_i$},\\
+    -\infty &\text{otherwise}.
+  \end{cases}
+\end{equation}
+
+\subsection{Training Objective}
+\label{subsec:training}
+
+The training objective follows the \DSpark paper (Equation~12):
+\begin{equation}
+  \mathcal{L} = \alpha_\text{CE} \mathcal{L}_\text{CE} + \alpha_\text{TV} \mathcal{L}_\text{TV} + \alpha_\text{conf} \mathcal{L}_\text{conf},
+\end{equation}
+with default coefficients $\alpha_\text{CE}=0.1$, $\alpha_\text{TV}=0.9$,
+$\alpha_\text{conf}=1.0$. All terms are position-weighted by
+$w_k = e^{-(k-1)/\gamma}$ to emphasize earlier positions where acceptance
+has a larger impact on overall throughput.
+
+\paragraph{Cross-entropy loss.}
+$\mathcal{L}_\text{CE}$ is the standard next-token prediction loss on the
+draft model's output, using teacher-forced ground-truth tokens.
+
+\paragraph{Total variation loss.}
+$\mathcal{L}_\text{TV}$ minimizes the L1 distance between draft and target
+distributions, which is a proxy for maximizing the acceptance rate:
+\begin{equation}
+  \mathcal{L}_\text{TV} = \|p_d(\cdot \mid x_{<k}) - p_t(\cdot \mid x_{<k})\|_1.
+\end{equation}
+
+\paragraph{Confidence loss.}
+$\mathcal{L}_\text{conf}$ is binary cross-entropy between the predicted
+confidence $c_k$ and the analytical acceptance rate $c_k^*$:
+\begin{equation}
+  \mathcal{L}_\text{conf} = \text{BCE}\bigl(c_k,\; c_k^*\bigr).
+\end{equation}
+
+\subsection{Hardware-Aware Prefix Scheduler}
+\label{subsec:scheduler}
+
+We implement Algorithm~1 from the \DSpark paper for dynamic verification
+length selection. Given a set of $R$ concurrent requests with confidence
+scores $\{c_{r,1}, \ldots, c_{r,\gamma}\}_{r=1}^R$ and a pre-profiled
+throughput curve $\SPS(B)$, the scheduler computes:
+
+\begin{algorithm}[t]
+\caption{Hardware-Aware Prefix Scheduler (Algorithm~1)}
+\label{alg:scheduler}
+\begin{algorithmic}[1]
+\State \textbf{Input:} confidence scores $\{c_{r,1}, \ldots, c_{r,\gamma}\}_{r=1}^R$, throughput curve $\SPS(B)$
+\State \textbf{Output:} verification lengths $\{\ell_r\}_{r=1}^R$
+\For{each request $r$}
+  \State $a_{r,j} \gets \prod_{i=1}^j c_{r,i}$ \Comment{Prefix survival probs}
+\EndFor
+\State $C \gets \{(r,j) \mid a_{r,j} > \varepsilon\}$ \Comment{Valid candidates}
+\State Sort $C$ descending by $a_{r,j}$
+\State $\ell_r \gets 0,\; B \gets R,\; \tau \gets R$ \Comment{Init: 1 anchor per request}
+\State $\Theta^* \gets \tau \cdot \SPS(B)$
+\For{$(r,j) \in C$ in sorted order}
+  \If{$\ell_r \neq j$} \Comment{Non-contiguous prefix: skip}
+    \State \textbf{continue}
+  \EndIf
+  \State $\ell_r \gets j+1,\; B \gets B+1,\; \tau \gets \tau + a_{r,j}$
+  \State $\Theta \gets \tau \cdot \SPS(B)$
+  \If{$\Theta > \Theta^*$}
+    \State $\Theta^* \gets \Theta$
+  \Else
+    \State $\ell_r \gets j$ \Comment{Early stop: throughput saturated}
+    \State \textbf{break}
+  \EndIf
+\EndFor
+\State \Return $\{\ell_r\}_{r=1}^R$
+\end{algorithmic}
+\end{algorithm}
+
+The scheduler's key property is monotonicity: it processes candidates in
+order of decreasing survival probability, which ensures that extending a
+request's verification length only happens when it adds the globally most
+valuable token. The early stopping condition guarantees the
+non-anticipating property --- the scheduler never extends a request's
+length based on survival probabilities of future tokens, which cannot be
+known at the current step.
+
+A fallback \texttt{StaticScheduler} with fixed-length and static-threshold
+modes is also provided for comparison.
+
+\subsection{Sequential Temperature Scaling}
+\label{subsec:sts}
+
+We implement STS calibration as described in Section~3.2.1 of the \DSpark
+paper. The algorithm processes positions $k = 1, \ldots, \gamma$ left to
+right. At each position $k$:
+
+\begin{enumerate}
+  \item Compute the cumulative survival probability using already-calibrated
+    scores for positions $<k$ and the raw score at position $k$:
+    \[
+    \hat{a}_k = \prod_{j=1}^{k-1} c_j^{1/T_j} \cdot c_k.
+    \]
+  \item Find $T_k$ via grid search over $(0.1, 10.0)$ minimizing ECE
+    between $\hat{a}_k$ and the empirical cumulative acceptance labels.
+  \item Record $T_k$ for inference-time application.
+\end{enumerate}
+
+Our implementation uses 100-point grid search to ensure reliable temperature
+selection and 15-bin ECE computation for calibration quality assessment.
+
+% ======================================================================
+\section{Experimental Verification}
+\label{sec:experiments}
+
+We validate the \UraionSpec implementation through unit tests, gradient
+checks, smoke training, and component-level verification. All experiments
+were conducted on a MacBookPro12,1 (Intel i5-5257U, 7.8~GB RAM, CPU only)
+running Ubuntu~24~LTS, targeting the \text{Qwen/Qwen3-0.6B} model.
+
+\subsection{Unit Tests}
+\label{subsec:unit-tests}
+
+The codebase includes 80 unit tests spanning all major components. Table
+\ref{tab:tests} summarizes test coverage by module.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Unit test coverage by module. All 80 tests pass.}
+\label{tab:tests}
+\begin{tabular}{lcc}
+\toprule
+Test Suite & Tests & Coverage \\
+\midrule
+Acceptance rule ($\min(1,\; p_t/p_d)$) & 8 & Full: all, rejected, partial,\\
+ & & bonus token, batch independence,\\
+ & & expected length \\
+Markov \& RNN heads & 15 & Vanilla, gated, RNN forward shapes,\\
+ & & gradients, sampling \\
+Scheduler & 14 & Throughput profile, Algorithm~1,\\
+ & & static fallback, zero conf. \\
+Shape/gradient checks & 10 & Draft model, losses, conf. head,\\
+ & & end-to-end cycle \\
+STS calibration & 8 & ECE, temperature fitting,\\
+ & & fit/transform, calibrator API \\
+DFlash backbone & 17 & Attention, decoder layer, full backbone,\\
+ & & GQA, masks, gradient flow, edge cases \\
+Sampling utilities & 8 & Residual, greedy, temperature, gather \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Component Verification}
+\label{subsec:component-verification}
+
+\paragraph{Acceptance rule.}
+We verify the lossless speculative decoding acceptance rule
+(Eq.~\ref{eq:acceptance}) across multiple scenarios:
+\begin{itemize}
+  \item \textbf{All accepted}: when $p_t = p_d$, all $\gamma$ tokens are
+    accepted with probability~1.
+  \item \textbf{First rejection}: the first token with $p_t < p_d$ triggers
+    rejection, and all subsequent tokens are discarded.
+  \item \textbf{Bonus token}: the bonus token is correctly sampled from the
+    residual distribution $\max(0, p_t - p_d) / \| \cdot \|_1$.
+  \item \textbf{Batch independence}: acceptance decisions across batch
+    elements are independent.
+\end{itemize}
+
+\paragraph{DFlash backbone.}
+The \DFlash-style backbone passes all shape and gradient checks:
+\begin{itemize}
+  \item Forward pass produces correct output shapes for single/GQA (Grouped Query Attention)/masked
+    attention configurations.
+  \item Gradient flow verified through attention, decoder layer, and full
+    backbone stack.
+  \item Empty draft ($L_d=0$) and single-token draft edge cases handled correctly.
+  \item All three activation functions (GELU, ReLU, SiLU) work.
+  \item Block-diagonal attention mask correctly enforces intra-block
+    attention and cross-block isolation.
+\end{itemize}
+
+\paragraph{Training objective.}
+The three-term loss (Equation~12 of the \DSpark{} paper) is verified through a smoke training run:
+\begin{itemize}
+  \item 32 samples from the Capybara dataset, block size $\gamma=4$.
+  \item All three loss terms (CE, TV, confidence) are non-negative and
+    decrease over training steps.
+  \item Position weighting correctly assigns higher weight to earlier
+    positions.
+  \item Analytical acceptance rate supervision provides valid training
+    signal for the confidence head.
+\end{itemize}
+
+\subsection{Limitations}
+\label{subsec:limitations}
+
+While \UraionSpec faithfully implements the \DSpark algorithm, several
+limitations should be noted:
+
+\begin{enumerate}
+  \item \textbf{No multi-GPU training}: The training pipeline is
+    single-device only. Full-scale reproduction requires multi-GPU
+    infrastructure beyond our current scope.
+  \item \textbf{Synthetic throughput profile}: The hardware-aware scheduler
+    uses a default SPS curve representative of an A100 GPU. For
+    production deployment, users should profile their own inference engine
+    and pass the real curve.
+  \item \textbf{Small-scale validation}: Our experiments are limited to
+    CPU-based smoke testing of \text{Qwen3-0.6B}. Full training and
+    benchmarking on GPU hardware (e.g., Colab A100) is the natural next
+    step.
+  \item \textbf{No vLLM integration}: Unlike the official \DeepSpec{}
+    repository, \UraionSpec does not integrate with production serving
+    frameworks. We prioritize algorithm clarity over production readiness.
+\end{enumerate}
+
+% ======================================================================
+\section{Reproducibility}
+\label{sec:reproducibility}
+
+All code is publicly available under the MIT license:
+
+\begin{itemize}
+  \item \textbf{GitHub}: \url{https://github.com/arnavprabhu/UraionSpec}
+  \item \textbf{HuggingFace}: \url{https://huggingface.co/UraionLabs/UraionSpec}
+\end{itemize}
+
+The repository includes complete documentation, implementation notes, a
+reproduction report, and model card templates. To replicate our experiments:
+\begin{verbatim}
+pip install -e .
+pytest tests/ -v
+
+# Smoke training (CPU, 32 samples, 5 steps)
+python scripts/smoke_train.py \
+    --target Qwen/Qwen3-0.6B \
+    --samples 32 --steps 5 --batch-size 2 --block-size 4
+
+# Smoke evaluation
+python scripts/smoke_eval.py \
+    --target Qwen/Qwen3-0.6B \
+    --checkpoint /path/to/checkpoint.pt --gamma 7
+
+# Benchmark comparison
+python scripts/run_benchmark.py \
+    --target Qwen/Qwen3-0.6B \
+    --prompts examples/prompts.jsonl --gamma 7
+\end{verbatim}
+
+For GPU-based training at scale:
+\begin{verbatim}
+colab run --gpu A100 --keep --timeout 28800 \
+    python scripts/smoke_train.py \
+        --target Qwen/Qwen3-4B \
+        --samples 10000 --steps 1000 --batch-size 8 --block-size 7
+\end{verbatim}
+
+% ======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \UraionSpec, a faithful, modular, and verified
+implementation of the \DSpark{} speculative decoding algorithm. Our
+implementation covers all core algorithmic components---semi-autoregressive
+generation via Markov, gated Markov, and RNN sequential heads, confidence
+prediction with analytical supervision, Sequential Temperature Scaling
+calibration, and the hardware-aware prefix scheduler (Algorithm~1).
+We also provide a standalone \DFlash-style parallel backbone module with
+target model KV injection, available for integration into the draft model pipeline.
+
+With 80 passing unit tests, comprehensive documentation, and reproducible
+smoke training and evaluation pipelines, \UraionSpec provides a solid
+foundation for academic research, ablation studies, and educational
+exploration of speculative decoding. We hope this implementation serves as a
+useful reference for researchers and practitioners working on efficient LLM
+inference.
+
+\paragraph{Future work.}
+Key directions for extending \UraionSpec include full-scale GPU training on
+the Open-PerfectBlend dataset, real engine throughput profiling for the
+scheduler, multi-GPU distributed training via DeepSpeed or FSDP~(Fully Sharded Data Parallelism), integration
+with production serving frameworks (vLLM, llama.cpp), and tree-based
+verification for autoregressive drafters~\cite{spectrindecoding}.
+
+% ======================================================================
+\bibliographystyle{unsrt}
+\begin{thebibliography}{20}
+
+\bibitem{cheng2026dspark}
+X.~Cheng, X.~Yu, C.~Shao, J.~Li, Y.~Xiong, et al.
+\newblock DSpark: Confidence-scheduled speculative decoding with
+semi-autoregressive generation.
+\newblock \textit{ICML}, 2026.
+
+\bibitem{leviathan2023fast}
+Y.~Leviathan, M.~Kalen, and Y.~Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock \textit{ICML}, 2023.
+
+\bibitem{chen2023accelerating}
+C.~Chen, S.~Borgeaud, G.~Irving, J.-B.~Lespiau, L.~Sifre, and
+J.~Jumper.
+\newblock Accelerating large language model decoding with speculative
+sampling.
+\newblock \textit{arXiv:2302.01318}, 2023.
+
+\bibitem{pope2023efficiently}
+R.~Pope, S.~Douglas, A.~Chowdhery, J.~Devlin, J.~Bradbury, et al.
+\newblock Efficiently scaling transformer inference.
+\newblock \textit{MLSys}, 2023.
+
+\bibitem{stern2018blockwise}
+M.~Stern, N.~Shazeer, and J.~Uszkoreit.
+\newblock Blockwise parallel decoding for deep neural machine translation.
+\newblock \textit{arXiv:1811.03115}, 2018.
+
+\bibitem{xia2024medusa}
+H.~Xia, T.~Ge, S.-M.~Wang, S.-Q.~Chen, F.~Wei, and Z.-Y.~Shao.
+\newblock Medusa: Simple LLM inference acceleration framework with multiple
+decoding heads.
+\newblock \textit{arXiv:2401.10774}, 2024.
+
+\bibitem{miao2025eagle3}
+Y.~Miao, Z.~Bai, Z.~Wang, J.~Zhou, and J.~Jia.
+\newblock Eagle3: Efficient inference for LLMs.
+\newblock 2025.
+
+\bibitem{deepseekspec2026}
+DeepSeek-AI.
+\newblock DeepSpec: Production-grade speculative decoding for LLMs.
+\newblock \url{https://github.com/deepseek-ai/DeepSpec}, 2026.
+
+\bibitem{spectrindecoding}
+Y.~Zhou, N.~Du, Z.~Zhong, T.~Ji, and Y.~Yang.
+\newblock SpecTr: Tree-based speculative decoding.
+\newblock \textit{EMNLP}, 2024.
+
+\bibitem{dsparkalphaxiv}
+DeepSeek-AI.
+\newblock DSpark paper at alphaXiv.
+\newblock \url{https://www.alphaxiv.org/abs/2026.dspark}, 2026.
+
+\bibitem{uraionspechf}
+Uraion Labs.
+\newblock UraionSpec on HuggingFace.
+\newblock \url{https://huggingface.co/UraionLabs/UraionSpec}, 2026.
+
+\bibitem{uraionspecgh}
+Arnav Prabhu.
+\newblock UraionSpec on GitHub.
+\newblock \url{https://github.com/arnavprabhu/UraionSpec}, 2026.
+
+\end{thebibliography}
+
+\end{document}

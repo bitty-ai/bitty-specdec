@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uraionspec"
+version = "0.1.0"
+description = "Faithful DSpark-style speculative decoding implementation by Uraion Labs"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Uraion Labs", email = "uraionlabs@gmail.com"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.38.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.25.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.64.0",
+    "sentencepiece>=0.1.99",
+    "protobuf>=3.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+    "pytest-cov>=4.1.0",
+]
+eval = [
+    "vllm>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
