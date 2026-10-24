@@ -53,6 +53,7 @@ def compute_dspark_loss(
     tv_alpha: float = 0.9,
     conf_alpha: float = 1.0,
     loss_decay_gamma: Optional[float] = None,
+    kl_alpha: float = 0.0,
 ) -> dict:
     """Compute DSpark loss with all three terms.
 
@@ -63,9 +64,11 @@ def compute_dspark_loss(
         target_logits: [B, N, block_size, V] target model logits (for TV loss)
         confidence_pred: [B, N, block_size] confidence logits (pre-sigmoid)
         confidence_targets: [B, N, block_size] target acceptance rates
+            (derived from the TV distance when None and target_logits is given)
         ce_alpha: Cross-entropy loss weight
         tv_alpha: Total variation loss weight
         conf_alpha: Confidence loss weight
+        kl_alpha: Forward KL(p_t || p_d) weight; unlike L1 it pushes up under-predicted tokens
         loss_decay_gamma: Position decay gamma (default: block_size)
 
     Returns:
@@ -82,25 +85,33 @@ def compute_dspark_loss(
     weight_mask = pos_weights.view(1, 1, block_size).expand(B, N, block_size)
     weight_mask = weight_mask * eval_mask.to(dtype=torch.float32)
 
+    weight_den = weight_mask.sum().clamp_min(1.0)
+
     # ========== 1. Cross-Entropy Loss ==========
-    flat_logits = draft_logits.reshape(-1, V)
-    flat_targets = target_ids.reshape(-1)
-    flat_weights = weight_mask.reshape(-1)
+    draft_logp = torch.log_softmax(draft_logits.float(), dim=-1)
+    ce_per_token = -draft_logp.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)  # [B, N, block_size]
+    ce_loss = (ce_per_token * weight_mask).sum() / weight_den
 
-    ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-    ce_loss_num = (ce_per_token * flat_weights).sum()
-    ce_loss_den = flat_weights.sum().clamp_min(1.0)
-    ce_loss = ce_loss_num / ce_loss_den
-
-    # ========== 2. Total Variation Loss ==========
+    # ========== 2. KL(p_t || p_d) and Total Variation Loss ==========
+    # Note: "tv" is the full L1 distance (= 2 * TV), as in the reference implementation.
     tv_loss = ce_loss.new_zeros(())
-    if target_logits is not None and tv_alpha > 0:
-        draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-        target_probs = torch.softmax(target_logits.float(), dim=-1)
-        tv_distance = (draft_probs - target_probs).abs().sum(dim=-1)  # [B, N, block_size]
-        tv_num = (tv_distance * weight_mask).sum()
-        tv_den = weight_mask.sum().clamp_min(1.0)
-        tv_loss = tv_num / tv_den
+    kl_loss = ce_loss.new_zeros(())
+    tv_distance = None
+    if target_logits is not None:
+        target_logp = torch.log_softmax(target_logits.float(), dim=-1)
+        target_probs = target_logp.exp()
+        if kl_alpha > 0:
+            kl_per_token = (target_probs * (target_logp - draft_logp)).sum(dim=-1)
+            kl_loss = (kl_per_token * weight_mask).sum() / weight_den
+        del target_logp
+        with torch.set_grad_enabled(torch.is_grad_enabled() and tv_alpha > 0):
+            tv_distance = (draft_logp.exp() - target_probs).abs().sum(dim=-1)  # [B, N, block_size]
+        del target_probs
+        tv_loss = (tv_distance * weight_mask).sum() / weight_den
+
+    # c*_k = 1 - 0.5 * ||p_d - p_t||_1
+    if confidence_targets is None and tv_distance is not None:
+        confidence_targets = (1.0 - 0.5 * tv_distance.detach()).clamp(0.0, 1.0)
 
     # ========== 3. Confidence Loss ==========
     conf_loss = ce_loss.new_zeros(())
@@ -110,27 +121,43 @@ def compute_dspark_loss(
             confidence_targets.float(),
             reduction="none",
         )
-        conf_num = (conf_errors * weight_mask).sum()
-        conf_den = weight_mask.sum().clamp_min(1.0)
-        conf_loss = conf_num / conf_den
+        conf_loss = (conf_errors * weight_mask).sum() / weight_den
 
     # Total loss
-    total_loss = ce_alpha * ce_loss + tv_alpha * tv_loss + conf_alpha * conf_loss
+    total_loss = ce_alpha * ce_loss + tv_alpha * tv_loss + kl_alpha * kl_loss + conf_alpha * conf_loss
 
     # Metrics
     metrics = {}
     with torch.no_grad():
         metrics["ce_loss"] = ce_loss.item()
         metrics["tv_loss"] = tv_loss.item()
+        metrics["kl_loss"] = kl_loss.item()
         metrics["conf_loss"] = conf_loss.item()
         metrics["loss"] = total_loss.item()
-        if eval_mask.any():
-            metrics["active_tokens"] = eval_mask.sum().item()
+        metrics["active_tokens"] = eval_mask.sum().item()
+        valid = eval_mask.float()
+        per_pos_count = valid.sum(dim=(0, 1)).clamp_min(1.0)
+        metrics["per_pos_ce"] = ((ce_per_token.detach() * valid).sum(dim=(0, 1)) / per_pos_count).tolist()
+        draft_top1 = draft_logits.argmax(dim=-1)
+        metrics["per_pos_acc_gt"] = (((draft_top1 == target_ids).float() * valid).sum(dim=(0, 1)) / per_pos_count).tolist()
+        if target_logits is not None:
+            accept = confidence_targets.float() * valid
+            metrics["per_pos_accept"] = (accept.sum(dim=(0, 1)) / per_pos_count).tolist()
+            top1_match = (draft_top1 == target_logits.argmax(dim=-1)).float() * valid
+            metrics["per_pos_top1_agree"] = (top1_match.sum(dim=(0, 1)) / per_pos_count).tolist()
+            # Teacher-forced expected accepted length per block (excludes the bonus token)
+            block_valid = eval_mask[..., 0]
+            n_blocks = block_valid.sum().clamp_min(1)
+            metrics["tau_expected"] = (torch.cumprod(accept, dim=-1).sum(-1)[block_valid].sum() / n_blocks).item()
+            metrics["tau_greedy"] = (torch.cumprod(top1_match, dim=-1).sum(-1)[block_valid].sum() / n_blocks).item()
+        if confidence_pred is not None and confidence_targets is not None:
+            metrics["conf_pred_mean"] = ((torch.sigmoid(confidence_pred.float()) * valid).sum() / valid.sum().clamp_min(1.0)).item()
 
     return {
         "loss": total_loss,
         "ce_loss": ce_loss,
         "tv_loss": tv_loss,
         "conf_loss": conf_loss,
+        "kl_loss": kl_loss,
         "metrics": metrics,
     }

@@ -18,8 +18,12 @@ class DSparkDataset(Dataset):
         input_ids: list[list[int]],
         attention_mask: Optional[list[list[int]]] = None,
         max_length: int = 2048,
+        loss_mask: Optional[list[list[int]]] = None,
     ):
         self.input_ids = [torch.tensor(ids, dtype=torch.long) for ids in input_ids]
+        self.loss_mask = (
+            [torch.tensor(m, dtype=torch.float32) for m in loss_mask] if loss_mask is not None else None
+        )
         if attention_mask is not None:
             self.attention_mask = [torch.tensor(m, dtype=torch.long) for m in attention_mask]
         else:
@@ -32,10 +36,13 @@ class DSparkDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
-        return {
+        item = {
             "input_ids": self.input_ids[idx][: self.max_length],
             "attention_mask": self.attention_mask[idx][: self.max_length],
         }
+        if self.loss_mask is not None:
+            item["loss_mask"] = self.loss_mask[idx][: self.max_length]
+        return item
 
 
 def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
@@ -60,13 +67,16 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
         dtype=torch.float32,
     )
 
-    for i, (ids, mask) in enumerate(zip(input_ids, attention_mask)):
+    for i, (item, ids, mask) in enumerate(zip(batch, input_ids, attention_mask)):
         seq_len = ids.shape[0]
         padded_ids[i, :seq_len] = ids
         padded_mask[i, :seq_len] = mask
-        # Loss mask: only predict on non-padding tokens, but not the first one
-        # (can't predict the first token without context)
-        loss_mask[i, 1:seq_len] = 1.0
+        if "loss_mask" in item:
+            loss_mask[i, :seq_len] = item["loss_mask"]
+        else:
+            # Only predict on non-padding tokens, but not the first one
+            loss_mask[i, 1:seq_len] = 1.0
+        loss_mask[i, 0] = 0.0
 
     return {
         "input_ids": padded_ids,
